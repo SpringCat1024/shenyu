@@ -48,6 +48,7 @@ import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
 import reactor.util.retry.Retry;
 import reactor.util.retry.RetryBackoffSpec;
 
@@ -113,16 +114,47 @@ public abstract class AbstractHttpClientPlugin<R> implements ShenyuPlugin {
     }
 
     private Mono<R> resend(final Mono<R> clientResponse,
-                           final ServerWebExchange exchange,
-                           final Duration duration,
-                           final Set<URI> exclude,
-                           final int retryTimes) {
-        Mono<R> result = clientResponse;
-        for (int i = 0; i < retryTimes; i++) {
-            result = resend(result, exchange, duration, exclude);
-        }
-        return result;
+                            final ServerWebExchange exchange,
+                            final Duration duration,
+                            final Set<URI> exclude,
+                            final int retryTimes) {
+
+        // Define a retry policy
+        RetryBackoffSpec retryBackoffSpec = Retry.backoff(retryTimes, Duration.ofMillis(200))
+                .maxBackoff(Duration.ofSeconds(3))
+                .transientErrors(true)
+                .jitter(0.5d)
+                // Target execution
+                .filter(ex -> ex instanceof ResponseStatusException)
+                .onRetryExhaustedThrow((retryBackoffSpecErr, retrySignal) -> {
+                    LOG.error("Retry limit reached, errorMsg: {}",retrySignal.failure().getMessage());
+                    throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE);
+                });
+
+        return clientResponse
+                .retryWhen(retryBackoffSpec.doAfterRetry(retrySignal -> {
+                    resend(clientResponse, exchange, duration, exclude).subscribe();
+                }))
+                .doFinally(signalType -> {
+                    if (signalType == SignalType.ON_ERROR) {
+                        LOG.error("Retry process ended with failure.");
+                    } else if (signalType == SignalType.ON_COMPLETE) {
+                        LOG.info("Retry process completed successfully.");
+                    }
+                });
     }
+
+//    private Mono<R> resend(final Mono<R> clientResponse,
+//                           final ServerWebExchange exchange,
+//                           final Duration duration,
+//                           final Set<URI> exclude,
+//                           final int retryTimes) {
+//        Mono<R> result = clientResponse;
+//        for (int i = 0; i < retryTimes; i++) {
+//            result = resend(result, exchange, duration, exclude);
+//        }
+//        return result;
+//    }
     
     private Mono<R> resend(final Mono<R> response,
                            final ServerWebExchange exchange,
